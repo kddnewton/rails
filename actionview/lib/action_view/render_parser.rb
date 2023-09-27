@@ -1,188 +1,142 @@
 # frozen_string_literal: true
 
-require "action_view/ripper_ast_parser"
+require "yarp"
 
 module ActionView
   class RenderParser # :nodoc:
+    ALL_KNOWN_KEYS = [:partial, :template, :layout, :formats, :locals, :object, :collection, :as, :status, :content_type, :location, :spacer_template]
+    RENDER_TYPE_KEYS = [:partial, :template, :layout]
+
     def initialize(name, code)
       @name = name
       @code = code
-      @parser = RipperASTParser
     end
 
     def render_calls
-      render_nodes = @parser.parse_render_nodes(@code)
+      queue = [YARP.parse(@code).value]
+      templates = []
 
-      render_nodes.map do |method, nodes|
-        nodes.map { |n| send(:parse_render, n) }
-      end.flatten.compact
+      while (node = queue.shift)
+        queue.concat(node.compact_child_nodes)
+        next unless node.is_a?(YARP::CallNode)
+
+        options = render_call_options(node)
+        next unless options
+
+        render_type = (options.keys & RENDER_TYPE_KEYS)[0]
+        template, object_template = render_call_template(options[render_type])
+        next unless template
+
+        if options.key?(:object) || options.key?(:collection) || object_template
+          next if options.key?(:object) && options.key?(:collection)
+          next unless options.key?(:partial)
+        end
+
+        if options[:spacer_template].is_a?(YARP::StringNode)
+          templates << partial_to_virtual_path(:partial, options[:spacer_template].unescaped)
+        end
+
+        templates << partial_to_virtual_path(render_type, template)
+
+        if render_type != :layout && options[:layout].is_a?(YARP::StringNode)
+          templates << partial_to_virtual_path(:layout, options[:layout].unescaped)
+        end
+      end
+
+      templates
     end
 
     private
-      def directory
-        File.dirname(@name)
-      end
+      # Accept a call node and return a hash of options for the render call. If
+      # it doesn't match the expected format, return nil.
+      def render_call_options(node)
+        # We are only looking for calls to render or render_to_string.
+        name = node.name.to_sym
+        return if name != :render && name != :render_to_string
 
-      def resolve_path_directory(path)
-        if path.include?("/")
-          path
-        else
-          "#{directory}/#{path}"
-        end
-      end
+        # We are only looking for calls with arguments.
+        arguments = node.arguments
+        return unless arguments
 
-      # Convert
-      #   render("foo", ...)
-      # into either
-      #   render(template: "foo", ...)
-      # or
-      #   render(partial: "foo", ...)
-      def normalize_args(string, options_hash)
-        if options_hash
-          { partial: string, locals: options_hash }
-        else
-          { partial: string }
-        end
-      end
+        arguments = arguments.arguments
+        length = arguments.length
 
-      def parse_render(node)
-        node = node.argument_nodes
+        # Get rid of any parentheses to get directly to the contents.
+        arguments.map! do |argument|
+          current = argument
 
-        if (node.length == 1 || node.length == 2) && !node[0].hash?
-          if node.length == 1
-            options = normalize_args(node[0], nil)
-          elsif node.length == 2
-            options = normalize_args(node[0], node[1])
+          while current.is_a?(YARP::ParenthesesNode) &&
+                current.body.is_a?(YARP::StatementsNode) &&
+                current.body.body.length == 1
+            current = current.body.body.first
           end
 
-          return nil unless options
-
-          parse_render_from_options(options)
-        elsif node.length == 1 && node[0].hash?
-          options = parse_hash_to_symbols(node[0])
-
-          return nil unless options
-
-          parse_render_from_options(options)
-        else
-          nil
+          current
         end
+
+        # We are only looking for arguments that are either a string with an
+        # array of locals or a keyword hash with symbol keys.
+        options =
+          if (length == 1 || length == 2) && !arguments[0].is_a?(YARP::KeywordHashNode)
+            { partial: arguments[0], locals: arguments[1] }
+          elsif length == 1 &&
+                arguments[0].is_a?(YARP::KeywordHashNode) &&
+                arguments[0].elements.all? do |element|
+                  element.is_a?(YARP::AssocNode) && element.key.is_a?(YARP::SymbolNode)
+                end
+            arguments[0].elements.to_h do |element|
+              [element.key.unescaped.to_sym, element.value]
+            end
+          end
+
+        return unless options
+
+        # Here we validate that the options have the keys we expect.
+        keys = options.keys
+        return if (keys & RENDER_TYPE_KEYS).empty?
+        return if (keys - ALL_KNOWN_KEYS).any?
+
+        # Finally, we can return a valid set of options.
+        options
       end
 
-      def parse_hash(node)
-        node.hash? && node.to_hash
-      end
-
-      def parse_hash_to_symbols(node)
-        hash = parse_hash(node)
-
-        return unless hash
-
-        hash.transform_keys do |key_node|
-          key = parse_sym(key_node)
-
-          return unless key
-
-          key
-        end
-      end
-
-      ALL_KNOWN_KEYS = [:partial, :template, :layout, :formats, :locals, :object, :collection, :as, :status, :content_type, :location, :spacer_template]
-
-      RENDER_TYPE_KEYS =
-        [:partial, :template, :layout]
-
-      def parse_render_from_options(options_hash)
-        renders = []
-        keys = options_hash.keys
-
-        if (keys & RENDER_TYPE_KEYS).size < 1
-          # Must have at least one of render keys
-          return nil
-        end
-
-        if (keys - ALL_KNOWN_KEYS).any?
-          # de-opt in case of unknown option
-          return nil
-        end
-
-        render_type = (keys & RENDER_TYPE_KEYS)[0]
-
-        node = options_hash[render_type]
-
-        if node.string?
-          template = resolve_path_directory(node.to_string)
-        else
-          if node.variable_reference?
-            dependency = node.variable_name.sub(/\A(?:\$|@{1,2})/, "")
-          elsif node.vcall?
-            dependency = node.variable_name
-          elsif node.call?
-            dependency = node.call_method_name
+      # Accept the node that is being passed in the position of the template and
+      # return the template name and whether or not it is an object template.
+      def render_call_template(node)
+        object_template = false
+        template =
+          if node.is_a?(YARP::StringNode)
+            path = node.unescaped
+            path.include?("/") ? path : "#{File.dirname(@name)}/#{path}"
           else
-            return
+            dependency =
+              case node
+              when YARP::ClassVariableReadNode
+                node.slice[2..]
+              when YARP::InstanceVariableReadNode
+                node.slice[1..]
+              when YARP::GlobalVariableReadNode
+                node.slice[1..]
+              when YARP::LocalVariableReadNode
+                node.slice
+              when YARP::CallNode
+                node.name
+              else
+                return
+              end
+
+            "#{dependency.pluralize}/#{dependency.singularize}"
           end
 
-          object_template = true
-          template = "#{dependency.pluralize}/#{dependency.singularize}"
-        end
-
-        return unless template
-
-        if spacer_template = render_template_with_spacer?(options_hash)
-          virtual_path = partial_to_virtual_path(:partial, spacer_template)
-          renders << virtual_path
-        end
-
-        if options_hash.key?(:object) || options_hash.key?(:collection) || object_template
-          return nil if options_hash.key?(:object) && options_hash.key?(:collection)
-          return nil unless options_hash.key?(:partial)
-        end
-
-        virtual_path = partial_to_virtual_path(render_type, template)
-        renders << virtual_path
-
-        # Support for rendering multiple templates (i.e. a partial with a layout)
-        if layout_template = render_template_with_layout?(render_type, options_hash)
-          virtual_path = partial_to_virtual_path(:layout, layout_template)
-
-          renders << virtual_path
-        end
-
-        renders
+        [template, object_template]
       end
 
-      def parse_str(node)
-        node.string? && node.to_string
+      def partial_to_virtual_path(render_type, partial_path)
+        if render_type == :partial || render_type == :layout
+          partial_path.gsub(%r{(/|^)([^/]*)\z}, '\1_\2')
+        else
+          partial_path
+        end
       end
-
-      def parse_sym(node)
-        node.symbol? && node.to_symbol
-      end
-
-      private
-        def render_template_with_layout?(render_type, options_hash)
-          if render_type != :layout && options_hash.key?(:layout)
-            parse_str(options_hash[:layout])
-          end
-        end
-
-        def render_template_with_spacer?(options_hash)
-          if options_hash.key?(:spacer_template)
-            parse_str(options_hash[:spacer_template])
-          end
-        end
-
-        def partial_to_virtual_path(render_type, partial_path)
-          if render_type == :partial || render_type == :layout
-            partial_path.gsub(%r{(/|^)([^/]*)\z}, '\1_\2')
-          else
-            partial_path
-          end
-        end
-
-        def layout_to_virtual_path(layout_path)
-          "layouts/#{layout_path}"
-        end
   end
 end
